@@ -1,4 +1,7 @@
 latest_snapshot.json
+history_log.csv
+news_test.txt
+news_test2.txt
 __pycache__/
 *.pyc
 .venv/

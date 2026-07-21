@@ -7,9 +7,12 @@ SK하이닉스 투자 모니터링 대시보드 (Streamlit)
 import datetime as dt
 import json
 import os
+import re
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import plotly.graph_objects as go
 import requests
 import streamlit as st
 import yfinance as yf
@@ -65,7 +68,26 @@ RISK_INDICATORS = {
     "원달러 환율": "USDKRW=X",
 }
 
+TARGET_PRICE_DEFAULT = 2_500_000
+STOP_LOSS_DEFAULT = round(AVG_PRICE * 0.85)  # 평단가 -15%
+STOP_LOSS_NEAR_PCT = 2  # 손절가 근접 기준(%)
+
+SCHEDULE = [
+    {"날짜": "2026-07-20", "계획": "2주", "실제": "2주", "매수가": "1,776,000원", "상태": "완료"},
+    {"날짜": "2026-07-21", "계획": "2주", "실제": "1주", "매수가": "1,817,000원", "상태": "진행중"},
+    {"날짜": "2026-07-22", "계획": "나머지 1주", "실제": "-", "매수가": "-", "상태": "예정"},
+    {"날짜": "2026-07-23", "계획": "0주(관망)", "실제": "-", "매수가": "-", "상태": "예정"},
+    {"날짜": "2026-07-24", "계획": "0주(실적일 매수금지)", "실제": "-", "매수가": "-", "상태": "예정"},
+    {"날짜": "2026-07-25~28", "계획": "4주", "실제": "-", "매수가": "-", "상태": "예정"},
+    {"날짜": "잔여", "계획": "2주(하방리스크 대비)", "실제": "-", "매수가": "-", "상태": "예정"},
+]
+
+NEWS_QUERIES = ["SK하이닉스", "삼성전자 반도체"]
+NEWS_TIME_PATTERN = re.compile(r"^(\d+(분|시간|일)\s*전|\d{4}\.\d{2}\.\d{2}\.?)$")
+
 SNAPSHOT_PATH = os.path.join(os.path.dirname(__file__), "latest_snapshot.json")
+HISTORY_PATH = os.path.join(os.path.dirname(__file__), "history_log.csv")
+HISTORY_COLUMNS = ["시각", "SK하이닉스가격", "평단가", "손익률", "손익금액"]
 
 st.set_page_config(page_title="SK하이닉스 투자 모니터링", layout="wide")
 
@@ -145,6 +167,39 @@ def fetch_yf(ticker):
     change_amt = price - prev
     change_pct = change_amt / prev * 100
     return price, change_pct, change_amt
+
+
+def fetch_naver_news(query, count=5):
+    """네이버 뉴스 검색 결과 상위 N개. 제목/링크/상대시각만 반환 (요약/논평 없음)."""
+    url = f"https://search.naver.com/search.naver?where=news&query={quote(query)}&sort=1"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    res = requests.get(url, headers=headers, timeout=5)
+    res.raise_for_status()
+    soup = BeautifulSoup(res.text, "html.parser")
+
+    spans = soup.select("span.sds-comps-text-type-headline1")[:count]
+    texts = soup.find_all(string=True)
+
+    results = []
+    for sp in spans:
+        a = sp.find_parent("a")
+        title = sp.get_text(strip=True)
+        href = a.get("href") if a else None
+
+        time_text = "-"
+        try:
+            idx = texts.index(sp.string)
+            for t in texts[idx + 1: idx + 15]:
+                s = t.strip()
+                if NEWS_TIME_PATTERN.match(s):
+                    time_text = s
+                    break
+        except ValueError:
+            pass
+
+        results.append({"제목": title, "링크": href, "시각": time_text})
+
+    return results
 
 
 # ========================= 전체 데이터 수집 + 알림 판정 =========================
@@ -291,6 +346,14 @@ def collect_all():
         pnl_pct = (sk_price - AVG_PRICE) / AVG_PRICE * 100
         pnl_amt = (sk_price - AVG_PRICE) * SHARES_OWNED
 
+    # ---- 관련 뉴스 ----
+    news = {}
+    for q in NEWS_QUERIES:
+        try:
+            news[q] = fetch_naver_news(q, count=5)
+        except Exception:
+            news[q] = []
+
     return {
         "collected_at": collected_at,
         "sk_price": sk_price,
@@ -299,6 +362,7 @@ def collect_all():
         "dday": dday,
         "alerts": alerts,
         "items": items,
+        "news": news,
     }
 
 
@@ -310,19 +374,50 @@ def save_snapshot(data):
         pass  # 클라우드 등 쓰기 불가 환경에서는 조용히 무시
 
 
+def load_history():
+    if os.path.exists(HISTORY_PATH):
+        try:
+            return pd.read_csv(HISTORY_PATH)
+        except Exception:
+            return pd.DataFrame(columns=HISTORY_COLUMNS)
+    return pd.DataFrame(columns=HISTORY_COLUMNS)
+
+
+def append_history(collected_at, sk_price, pnl_pct, pnl_amt):
+    if sk_price is None:
+        return
+    row = pd.DataFrame([{
+        "시각": collected_at.replace(" (KST)", ""),
+        "SK하이닉스가격": sk_price,
+        "평단가": AVG_PRICE,
+        "손익률": pnl_pct,
+        "손익금액": pnl_amt,
+    }])
+    try:
+        header = not os.path.exists(HISTORY_PATH)
+        row.to_csv(HISTORY_PATH, mode="a", header=header, index=False, encoding="utf-8-sig")
+    except Exception:
+        pass  # 클라우드 등 쓰기 불가 환경에서는 조용히 무시
+
+
+def refresh_data():
+    data = collect_all()
+    save_snapshot(data)
+    append_history(data["collected_at"], data["sk_price"], data["pnl_pct"], data["pnl_amt"])
+    return data
+
+
 # ========================= UI =========================
 
 st.title("SK하이닉스 투자 모니터링")
 
 if "data" not in st.session_state:
-    st.session_state["data"] = collect_all()
-    save_snapshot(st.session_state["data"])
+    st.session_state["data"] = refresh_data()
 
 col_btn, col_time = st.columns([1, 3])
 with col_btn:
     if st.button("현재 시간 반영", type="primary"):
-        st.session_state["data"] = collect_all()
-        save_snapshot(st.session_state["data"])
+        st.session_state["data"] = refresh_data()
 
 data = st.session_state["data"]
 
@@ -346,6 +441,80 @@ if data["alerts"]:
 else:
     st.success("조건 충족 알림 없음")
 
+# ---- 목표가 / 손절가 ----
+st.divider()
+st.subheader("목표가 / 손절가")
+
+if "target_price" not in st.session_state:
+    st.session_state["target_price"] = TARGET_PRICE_DEFAULT
+if "stop_loss_price" not in st.session_state:
+    st.session_state["stop_loss_price"] = STOP_LOSS_DEFAULT
+
+col_tp, col_sl = st.columns(2)
+with col_tp:
+    target_price = st.number_input(
+        "목표가(원)", min_value=0, step=10_000, key="target_price",
+    )
+with col_sl:
+    stop_loss_price = st.number_input(
+        "손절가(원)", min_value=0, step=10_000, key="stop_loss_price",
+    )
+
+sk_price = data["sk_price"]
+if sk_price is not None:
+    upside_pct = (target_price - sk_price) / sk_price * 100
+    st.write(f"목표가까지 남은 상승률: {upside_pct:+.2f}%")
+
+    denom = target_price - AVG_PRICE
+    progress = (sk_price - AVG_PRICE) / denom if denom != 0 else 0.0
+    progress_clamped = min(max(progress, 0.0), 1.0)
+    st.progress(progress_clamped, text=f"평단가→목표가 진행률: {progress * 100:.1f}%")
+
+    if sk_price <= stop_loss_price:
+        st.error(f"손절가 이탈: 현재가 {sk_price:,.0f}원 ≤ 손절가 {stop_loss_price:,.0f}원")
+    elif sk_price <= stop_loss_price * (1 + STOP_LOSS_NEAR_PCT / 100):
+        st.warning(
+            f"손절 검토 구간: 현재가 {sk_price:,.0f}원 "
+            f"(손절가 {stop_loss_price:,.0f}원 +{STOP_LOSS_NEAR_PCT}% 이내)"
+        )
+else:
+    st.write("SK하이닉스 현재가 데이터 없음")
+
+# ---- 주가 / 손익률 추이 차트 ----
+st.divider()
+st.subheader("수익 현황 추이")
+
+history_df = load_history()
+if history_df.empty:
+    st.info("차트를 표시할 이력 데이터가 아직 없습니다. '현재 시간 반영'을 눌러 데이터를 쌓아주세요.")
+else:
+    x = pd.to_datetime(history_df["시각"])
+
+    fig_price = go.Figure()
+    fig_price.add_trace(go.Scatter(
+        x=x, y=history_df["SK하이닉스가격"], mode="lines+markers", name="SK하이닉스",
+    ))
+    fig_price.add_hline(y=target_price, line_dash="dash", line_color="green", annotation_text="목표가")
+    fig_price.add_hline(y=stop_loss_price, line_dash="dash", line_color="red", annotation_text="손절가")
+    fig_price.add_hline(y=AVG_PRICE, line_dash="dash", line_color="gray", annotation_text="평단가")
+    fig_price.update_layout(title="SK하이닉스 주가 추이", xaxis_title="시각", yaxis_title="가격(원)", height=400)
+    st.plotly_chart(fig_price)
+
+    fig_pnl = go.Figure()
+    fig_pnl.add_trace(go.Scatter(
+        x=x, y=history_df["손익률"], mode="lines+markers", name="손익률(%)",
+    ))
+    fig_pnl.update_layout(title="손익률 추이", xaxis_title="시각", yaxis_title="손익률(%)", height=300)
+    st.plotly_chart(fig_pnl)
+
+# ---- 매수 스케줄 ----
+st.divider()
+st.subheader("매수 스케줄")
+st.dataframe(pd.DataFrame(SCHEDULE), width="stretch", hide_index=True)
+
+buy_progress = min(SHARES_OWNED / TOTAL_PLAN, 1.0)
+st.progress(buy_progress, text=f"누적 매수 진행률: {SHARES_OWNED}/{TOTAL_PLAN}주 ({buy_progress * 100:.0f}%)")
+
 df = pd.DataFrame(data["items"])
 
 
@@ -363,6 +532,18 @@ show_section("관련주 (지수보다 우선 참고)", "관련주")
 show_section("참고: 미국 반도체주", "참고")
 show_section("지수", "지수")
 show_section("변동성 / 리스크 지표", "리스크")
+
+# ---- 관련 뉴스 ----
+st.divider()
+st.subheader("관련 뉴스")
+for q in NEWS_QUERIES:
+    st.markdown(f"**{q}**")
+    news_items = data["news"].get(q, [])
+    if not news_items:
+        st.write("수집 실패 또는 검색 결과 없음")
+    else:
+        for n in news_items:
+            st.markdown(f"- [{n['제목']}]({n['링크']}) &nbsp;·&nbsp; {n['시각']}")
 
 # ---- 스냅샷 다운로드 ----
 st.divider()
