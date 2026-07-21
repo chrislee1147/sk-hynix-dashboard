@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 SK하이닉스 투자 모니터링 대시보드 (Streamlit)
+핵심 목적: 관련주 + 지수의 정규장/시간외 시세와 관련 뉴스를 한 화면에서 확인
 실행: streamlit run streamlit_app.py
 """
 
@@ -12,17 +13,18 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-import plotly.graph_objects as go
 import requests
 import streamlit as st
 import yfinance as yf
 from bs4 import BeautifulSoup
 
 KST = ZoneInfo("Asia/Seoul")
+NY_TZ = ZoneInfo("America/New_York")
 
 
 def now_kst():
     return dt.datetime.now(KST)
+
 
 # ========================= CONFIG =========================
 
@@ -50,63 +52,52 @@ US_RELATED = {
     "마벨(MRVL)": "MRVL",
     "테라다인(TER)": "TER",
 }
-# "관련주 신호 발생" 등락률 알림은 최초 요청대로 이 4종목 평균만 사용
 US_RELATED_ALERT_SET = ["마이크론(MU)", "샌디스크(SNDK)", "웨스턴디지털(WDC)", "SK하이닉스 ADR"]
-
 GAP_ALERT_THRESHOLD = 3  # 시간외 괴리 평균 알림 기준(%p)
 GAP_HIGHLIGHT_THRESHOLD = 3  # 표 하이라이트 기준(%p)
 
 INDICES = {
     "코스피": "^KS11",
     "코스닥": "^KQ11",
-    "닛케이225": "^N225",
-    "상해종합": "000001.SS",
     "나스닥종합": "^IXIC",
     "S&P500": "^GSPC",
     "필라델피아반도체(SOX)": "^SOX",
 }
-ASIA_INDEX_NAMES = ["코스피", "코스닥", "닛케이225", "상해종합"]
 
 RISK_INDICATORS = {
     "VIX": "^VIX",
     "WTI 국제유가": "CL=F",
-    "원달러 환율": "USDKRW=X",
 }
 
 TARGET_PRICE_DEFAULT = 2_500_000
 STOP_LOSS_RATIO = 0.85  # 손절가 기본값 = 평단가 -15%
 STOP_LOSS_NEAR_PCT = 2  # 손절가 근접 기준(%)
 
-SCHEDULE = [
-    {"날짜": "2026-07-20", "계획": "2주", "실제": "2주", "매수가": "1,776,000원", "상태": "완료"},
-    {"날짜": "2026-07-21", "계획": "2주", "실제": "1주", "매수가": "1,817,000원", "상태": "진행중"},
-    {"날짜": "2026-07-22", "계획": "나머지 1주", "실제": "-", "매수가": "-", "상태": "예정"},
-    {"날짜": "2026-07-23", "계획": "0주(관망)", "실제": "-", "매수가": "-", "상태": "예정"},
-    {"날짜": "2026-07-24", "계획": "0주(실적일 매수금지)", "실제": "-", "매수가": "-", "상태": "예정"},
-    {"날짜": "2026-07-25~28", "계획": "4주", "실제": "-", "매수가": "-", "상태": "예정"},
-    {"날짜": "잔여", "계획": "2주(하방리스크 대비)", "실제": "-", "매수가": "-", "상태": "예정"},
-]
+# 시간외 세션 예상 시간대 (참고용 — 실제 거래소 상태는 API 응답이 우선)
+DOMESTIC_OVERTIME_START = dt.time(16, 0)
+DOMESTIC_OVERTIME_END = dt.time(18, 0)
+US_PREMARKET_START = dt.time(4, 0)
+US_PREMARKET_END = dt.time(9, 30)
+US_REGULAR_START = dt.time(9, 30)
+US_REGULAR_END = dt.time(16, 0)
+US_AFTERHOURS_START = dt.time(16, 0)
+US_AFTERHOURS_END = dt.time(20, 0)
 
 NEWS_QUERIES = ["SK하이닉스", "삼성전자 반도체"]
 NEWS_TIME_PATTERN = re.compile(r"^(\d+(분|시간|일)\s*전|\d{4}\.\d{2}\.\d{2}\.?)$")
 
 SNAPSHOT_PATH = os.path.join(os.path.dirname(__file__), "latest_snapshot.json")
-HISTORY_PATH = os.path.join(os.path.dirname(__file__), "history_log.csv")
-HISTORY_COLUMNS = ["시각", "SK하이닉스가격", "평단가", "손익률", "손익금액"]
 
 TRADES_PATH = os.path.join(os.path.dirname(__file__), "trades.csv")
-TRADES_COLUMNS = ["날짜", "수량", "매수가"]
 SEED_TRADES = [
     {"날짜": "2026-07-20", "수량": 2, "매수가": 1_776_000},
     {"날짜": "2026-07-21", "수량": 1, "매수가": 1_817_000},
 ]
 
-ALERT_LOG_PATH = os.path.join(os.path.dirname(__file__), "alert_history.csv")
-
 st.set_page_config(page_title="SK하이닉스 투자 모니터링", layout="wide")
 
 
-# ========================= 데이터 수집 =========================
+# ========================= 데이터 수집: 국내 =========================
 
 def fetch_naver(code):
     """네이버 폴링 API. 정규장가/등락 + 시간외 단일가(있으면) 반환.
@@ -130,13 +121,21 @@ def fetch_naver(code):
     overtime_price = None
     overtime_pct = None
     over = item.get("overMarketPriceInfo")
-    if over and over.get("overPrice") and over.get("overMarketStatus") == "OPEN":
-        overtime_price = to_num(over["overPrice"])
-        overtime_pct = to_num(over.get("fluctuationsRatio", 0))
-        if over.get("compareToPreviousPrice", {}).get("name") == "FALLING":
-            overtime_pct = -abs(overtime_pct)
+    if over is None:
+        overtime_status = "시간외 정보 없음(API 응답에 필드 자체가 없음)"
+    else:
+        status = over.get("overMarketStatus")
+        session_type = over.get("tradingSessionType", "-")
+        if status == "OPEN" and over.get("overPrice"):
+            overtime_price = to_num(over["overPrice"])
+            overtime_pct = to_num(over.get("fluctuationsRatio", 0))
+            if over.get("compareToPreviousPrice", {}).get("name") == "FALLING":
+                overtime_pct = -abs(overtime_pct)
+            overtime_status = f"진행중({session_type})"
+        else:
+            overtime_status = f"세션 종료/휴장(overMarketStatus={status})"
 
-    return price, change_pct, change_amt, "naver", overtime_price, overtime_pct
+    return price, change_pct, change_amt, "naver", overtime_price, overtime_pct, overtime_status
 
 
 def fetch_pykrx(code):
@@ -153,39 +152,7 @@ def fetch_pykrx(code):
     prev_close = float(df["종가"].iloc[-2])
     change_amt = close - prev_close
     change_pct = change_amt / prev_close * 100
-    return close, change_pct, change_amt, "pykrx(일별)", None, None
-
-
-def fetch_investor_flows(code):
-    """일별 외국인/기관/개인 순매수 금액(원). KRX_ID/KRX_PW 환경변수 필요."""
-    if not (os.environ.get("KRX_ID") and os.environ.get("KRX_PW")):
-        raise ValueError("KRX_ID/KRX_PW 환경변수 미설정 (data.krx.co.kr 회원가입 후 설정 필요)")
-
-    from pykrx import stock
-
-    today = now_kst().date()
-    for i in range(6):
-        target = today - dt.timedelta(days=i)
-        d_str = target.strftime("%Y%m%d")
-        try:
-            df = stock.get_market_trading_value_by_investor(d_str, d_str, code)
-            if df is None or df.empty:
-                continue
-            result = {}
-            for label, candidates in [
-                ("외국인", ["외국인합계", "외국인"]),
-                ("기관", ["기관합계", "기관"]),
-                ("개인", ["개인"]),
-            ]:
-                for cand in candidates:
-                    if cand in df.index:
-                        result[label] = float(df.loc[cand, "순매수"])
-                        break
-            if result:
-                return result, target.strftime("%Y-%m-%d")
-        except Exception:
-            continue
-    raise ValueError("수급 데이터 조회 실패")
+    return close, change_pct, change_amt, "pykrx(일별)", None, None, "pykrx 폴백 사용(시간외 데이터 미제공)"
 
 
 def fetch_domestic(code):
@@ -195,7 +162,10 @@ def fetch_domestic(code):
         return fetch_pykrx(code)
 
 
+# ========================= 데이터 수집: 해외 =========================
+
 def fetch_yf(ticker):
+    """정규장 등락(fast_info 기준). 지수/리스크 지표 및 시간외 폴백에 사용."""
     t = yf.Ticker(ticker)
     price = None
     prev = None
@@ -220,16 +190,15 @@ def fetch_yf(ticker):
     return price, change_pct, change_amt
 
 
-def fetch_yf_extended(ticker):
-    """정규장 등락 + 시간외(프리마켓/애프터마켓). 시간외 데이터 없으면 (None, None, None)."""
+def _fetch_extended_via_info(ticker):
+    """1차 방법: yfinance Ticker.info의 marketState/preMarketPrice/postMarketPrice 사용."""
     t = yf.Ticker(ticker)
     info = t.info
 
     price = info.get("regularMarketPrice")
     prev = info.get("regularMarketPreviousClose") or info.get("previousClose")
     if price is None or prev is None:
-        price, change_pct, change_amt = fetch_yf(ticker)
-        return price, change_pct, change_amt, None, None, None
+        raise ValueError("info 응답에 regularMarketPrice/previousClose 없음")
 
     price = float(price)
     prev = float(prev)
@@ -238,18 +207,74 @@ def fetch_yf_extended(ticker):
 
     ext_price = None
     ext_pct = None
-    ext_label = None
     state = info.get("marketState")
-    if state == "PRE" and info.get("preMarketPrice") is not None:
-        ext_price = float(info["preMarketPrice"])
-        ext_pct = info.get("preMarketChangePercent")
-        ext_label = "프리마켓"
-    elif state in ("POST", "POSTPOST") and info.get("postMarketPrice") is not None:
-        ext_price = float(info["postMarketPrice"])
-        ext_pct = info.get("postMarketChangePercent")
-        ext_label = "애프터마켓"
+
+    if state == "PRE":
+        if info.get("preMarketPrice") is not None:
+            ext_price = float(info["preMarketPrice"])
+            ext_pct = info.get("preMarketChangePercent")
+            ext_label = "프리마켓(info)"
+        else:
+            ext_label = "프리마켓(info, 가격 데이터 없음)"
+    elif state in ("POST", "POSTPOST"):
+        if info.get("postMarketPrice") is not None:
+            ext_price = float(info["postMarketPrice"])
+            ext_pct = info.get("postMarketChangePercent")
+            ext_label = "애프터마켓(info)"
+        else:
+            ext_label = "애프터마켓(info, 가격 데이터 없음)"
+    elif state == "REGULAR":
+        ext_label = "정규장 중(info, 시간외 없음)"
+    elif state == "CLOSED":
+        ext_label = "휴장(info, 시간외 없음)"
+    elif state is None:
+        ext_label = "상태 정보 없음(info, marketState 필드 없음)"
+    else:
+        ext_label = f"상태불명(info, marketState={state})"
 
     return price, change_pct, change_amt, ext_price, ext_pct, ext_label
+
+
+def _fetch_extended_via_history(ticker):
+    """2차 방법(폴백): Ticker.history(1분봉, prepost=True)의 마지막 봉으로 시간외가 판정.
+    정규장 등락은 이미 검증된 fetch_yf()를 그대로 사용."""
+    price, change_pct, change_amt = fetch_yf(ticker)
+
+    t = yf.Ticker(ticker)
+    hist = t.history(period="1d", interval="1m", prepost=True)
+    if hist is None or hist.empty:
+        raise ValueError("1분봉 데이터 없음(history)")
+
+    idx = hist.index
+    if idx.tz is None:
+        idx = idx.tz_localize("UTC")
+    idx_ny = idx.tz_convert(NY_TZ)
+    last_time = idx_ny[-1].time()
+    last_close = float(hist["Close"].iloc[-1])
+
+    if last_time >= US_AFTERHOURS_START:
+        label = "애프터마켓(history)"
+    elif last_time < US_REGULAR_START:
+        label = "프리마켓(history)"
+    else:
+        return price, change_pct, change_amt, None, None, "정규장 중(history, 시간외 없음)"
+
+    ext_pct = (last_close - price) / price * 100 if price else None
+    return price, change_pct, change_amt, last_close, ext_pct, label
+
+
+def fetch_yf_extended(ticker):
+    """정규장 등락 + 시간외(프리마켓/애프터마켓).
+    info 방식을 먼저 시도하고 실패하면 history 방식으로 폴백한다.
+    실패/무데이터 사유는 항상 ext_label에 담아 화면에 그대로 노출한다."""
+    try:
+        return _fetch_extended_via_info(ticker)
+    except Exception as e_info:
+        try:
+            price, change_pct, change_amt, ext_price, ext_pct, ext_label = _fetch_extended_via_history(ticker)
+            return price, change_pct, change_amt, ext_price, ext_pct, f"{ext_label} [info 실패로 대체: {e_info}]"
+        except Exception as e_hist:
+            raise ValueError(f"info 실패({e_info}) / history 실패({e_hist})")
 
 
 def fetch_naver_news(query, count=5):
@@ -300,12 +325,13 @@ def collect_all(avg_price, shares_owned):
     # 국내 (정규장 + 시간외)
     for name, code in DOMESTIC.items():
         try:
-            price, pct, amt, source, ot_price, ot_pct = fetch_domestic(code)
+            price, pct, amt, source, ot_price, ot_pct, ot_status = fetch_domestic(code)
             if code == "000660":
                 sk_price = price
             items.append({
                 "구분": "국내", "항목": name, "현재가": round(price, 2),
                 "등락률(%)": round(pct, 2), "등락폭": round(amt, 2),
+                "시간외상태": ot_status,
                 "시간외가": round(ot_price, 2) if ot_price is not None else None,
                 "시간외등락률(%)": round(ot_pct, 2) if ot_pct is not None else None,
                 "출처": source, "알림": "",
@@ -314,25 +340,9 @@ def collect_all(avg_price, shares_owned):
             items.append({
                 "구분": "국내", "항목": name, "현재가": None,
                 "등락률(%)": None, "등락폭": None,
+                "시간외상태": f"수집실패: {e}",
                 "시간외가": None, "시간외등락률(%)": None,
                 "출처": "실패", "알림": f"수집실패: {e}",
-            })
-
-    # 국내 수급 (외국인/기관/개인 순매수)
-    for name, code in DOMESTIC.items():
-        try:
-            flows, flow_date = fetch_investor_flows(code)
-            for investor, amt in flows.items():
-                items.append({
-                    "구분": "수급", "항목": f"{name} - {investor}({flow_date})",
-                    "현재가": round(amt), "등락률(%)": None, "등락폭": None,
-                    "출처": "pykrx", "알림": "",
-                })
-        except Exception as e:
-            items.append({
-                "구분": "수급", "항목": f"{name} 수급", "현재가": None,
-                "등락률(%)": None, "등락폭": None, "출처": "실패",
-                "알림": f"수집실패: {e}",
             })
 
     # 관련주 (정규장 + 시간외 + 괴리)
@@ -349,7 +359,7 @@ def collect_all(avg_price, shares_owned):
             items.append({
                 "구분": "관련주", "항목": name, "현재가": round(price, 2),
                 "등락률(%)": round(pct, 2), "등락폭": round(amt, 2),
-                "시간외구분": ext_label or "-",
+                "시간외구분": ext_label,
                 "시간외가": round(ext_price, 2) if ext_price is not None else None,
                 "시간외등락률(%)": round(ext_pct, 2) if ext_pct is not None else None,
                 "괴리(%p)": gap,
@@ -359,7 +369,7 @@ def collect_all(avg_price, shares_owned):
             items.append({
                 "구분": "관련주", "항목": name, "현재가": None,
                 "등락률(%)": None, "등락폭": None,
-                "시간외구분": "-", "시간외가": None, "시간외등락률(%)": None,
+                "시간외구분": f"수집실패: {e}", "시간외가": None, "시간외등락률(%)": None,
                 "괴리(%p)": None,
                 "출처": "데이터 없음", "알림": f"수집실패: {e}",
             })
@@ -488,32 +498,6 @@ def save_snapshot(data):
         pass  # 클라우드 등 쓰기 불가 환경에서는 조용히 무시
 
 
-def load_history():
-    if os.path.exists(HISTORY_PATH):
-        try:
-            return pd.read_csv(HISTORY_PATH)
-        except Exception:
-            return pd.DataFrame(columns=HISTORY_COLUMNS)
-    return pd.DataFrame(columns=HISTORY_COLUMNS)
-
-
-def append_history(collected_at, sk_price, avg_price, pnl_pct, pnl_amt):
-    if sk_price is None:
-        return
-    row = pd.DataFrame([{
-        "시각": collected_at.replace(" (KST)", ""),
-        "SK하이닉스가격": sk_price,
-        "평단가": avg_price,
-        "손익률": pnl_pct,
-        "손익금액": pnl_amt,
-    }])
-    try:
-        header = not os.path.exists(HISTORY_PATH)
-        row.to_csv(HISTORY_PATH, mode="a", header=header, index=False, encoding="utf-8-sig")
-    except Exception:
-        pass  # 클라우드 등 쓰기 불가 환경에서는 조용히 무시
-
-
 def load_trades():
     if not os.path.exists(TRADES_PATH):
         seed_df = pd.DataFrame(SEED_TRADES)
@@ -544,24 +528,9 @@ def compute_position(trades_df):
     return round(avg), shares
 
 
-def append_alert_log(collected_at, alerts):
-    if not alerts:
-        return
-    rows = pd.DataFrame([
-        {"시각": collected_at.replace(" (KST)", ""), "알림내용": a} for a in alerts
-    ])
-    try:
-        header = not os.path.exists(ALERT_LOG_PATH)
-        rows.to_csv(ALERT_LOG_PATH, mode="a", header=header, index=False, encoding="utf-8-sig")
-    except Exception:
-        pass  # 클라우드 등 쓰기 불가 환경에서는 조용히 무시
-
-
 def refresh_data(avg_price, shares_owned):
     data = collect_all(avg_price, shares_owned)
     save_snapshot(data)
-    append_history(data["collected_at"], data["sk_price"], avg_price, data["pnl_pct"], data["pnl_amt"])
-    append_alert_log(data["collected_at"], data["alerts"])
     return data
 
 
@@ -585,11 +554,43 @@ def check_target(sk_price, target_price):
     return None
 
 
+def style_df(sub):
+    """숫자 컬럼에 천단위 콤마 서식 적용 (금액류 0자리, %류 2자리), 결측치는 '-'로 표시."""
+    fmt = {}
+    for col in sub.columns:
+        if sub[col].dtype.kind not in "if":
+            continue
+        fmt[col] = "{:,.2f}" if "%" in col else "{:,.0f}"
+    return sub.style.format(fmt, na_rep="-")
+
+
+def get_session_status():
+    """시계 기준 예상 시간외 세션 여부 (참고용). 실제 거래소 상태는 API 응답이 우선."""
+    now_kr = now_kst()
+    kr_overtime = (
+        now_kr.weekday() < 5
+        and DOMESTIC_OVERTIME_START <= now_kr.time() < DOMESTIC_OVERTIME_END
+    )
+
+    now_ny = dt.datetime.now(NY_TZ)
+    is_weekday_ny = now_ny.weekday() < 5
+    us_pre = is_weekday_ny and US_PREMARKET_START <= now_ny.time() < US_PREMARKET_END
+    us_after = is_weekday_ny and US_AFTERHOURS_START <= now_ny.time() < US_AFTERHOURS_END
+
+    return {
+        "kr_overtime": kr_overtime,
+        "kr_time_str": now_kr.strftime("%H:%M (%a)"),
+        "us_pre": us_pre,
+        "us_after": us_after,
+        "us_time_str": now_ny.strftime("%H:%M (%a)"),
+    }
+
+
 # ========================= UI =========================
 
 st.title("SK하이닉스 투자 모니터링")
 
-# 매수 기록(trades.csv) 기반 평단가/보유주수 계산 — 화면 하단 폼에서 갱신 가능
+# 매수 기록(trades.csv) 기반 평단가/보유주수 계산
 trades_df = load_trades()
 AVG_PRICE, SHARES_OWNED = compute_position(trades_df)
 STOP_LOSS_DEFAULT = round(AVG_PRICE * STOP_LOSS_RATIO) if AVG_PRICE else 0
@@ -609,7 +610,32 @@ with col_time:
     st.write(f"현재 시각: {now_kst().strftime('%Y-%m-%d %H:%M:%S')} (KST)")
     st.write(f"마지막 갱신 시각: {data['collected_at']}")
 
-# ---- 상단 요약 (평단가/보유주수는 trades.csv 최신값으로 즉시 반영) ----
+# ---- 시간외 세션 여부 ----
+session = get_session_status()
+col_sess1, col_sess2 = st.columns(2)
+with col_sess1:
+    kr_label = "예" if session["kr_overtime"] else "아니오"
+    st.write(
+        f"현재 시간외 세션 여부 (국내, 16:00~18:00 KST): **{kr_label}** "
+        f"(현재 KST {session['kr_time_str']})"
+    )
+with col_sess2:
+    if session["us_pre"]:
+        us_label = "예 (프리마켓)"
+    elif session["us_after"]:
+        us_label = "예 (애프터마켓)"
+    else:
+        us_label = "아니오"
+    st.write(
+        f"현재 시간외 세션 여부 (미국, 프리 04:00~09:30 / 애프터 16:00~20:00 ET): **{us_label}** "
+        f"(현재 뉴욕시간 {session['us_time_str']})"
+    )
+st.caption(
+    "위는 시계 기준 예상치입니다. 실제 거래소 상태는 아래 국내/관련주 표의 "
+    "\"시간외상태\"/\"시간외구분\" 열에 표시되는 값이 최종 근거입니다."
+)
+
+# ---- 상단 요약 ----
 if sk_price is not None and AVG_PRICE:
     live_pnl_pct = (sk_price - AVG_PRICE) / AVG_PRICE * 100
     live_pnl_amt = (sk_price - AVG_PRICE) * SHARES_OWNED
@@ -643,22 +669,13 @@ if "stop_loss_price" not in st.session_state:
 
 col_tp, col_sl = st.columns(2)
 with col_tp:
-    target_price = st.number_input(
-        "목표가(원)", min_value=0, step=10_000, key="target_price",
-    )
+    target_price = st.number_input("목표가(원)", min_value=0, step=10_000, key="target_price")
 with col_sl:
-    stop_loss_price = st.number_input(
-        "손절가(원)", min_value=0, step=10_000, key="stop_loss_price",
-    )
+    stop_loss_price = st.number_input("손절가(원)", min_value=0, step=10_000, key="stop_loss_price")
 
 if sk_price is not None:
     upside_pct = (target_price - sk_price) / sk_price * 100
     st.write(f"목표가까지 남은 상승률: {upside_pct:+.2f}%")
-
-    denom = target_price - AVG_PRICE
-    progress = (sk_price - AVG_PRICE) / denom if denom != 0 else 0.0
-    progress_clamped = min(max(progress, 0.0), 1.0)
-    st.progress(progress_clamped, text=f"평단가→목표가 진행률: {progress * 100:.1f}%")
 
     target_state = check_target(sk_price, target_price)
     if target_state == "reached":
@@ -674,33 +691,6 @@ if sk_price is not None:
         )
 else:
     st.write("SK하이닉스 현재가 데이터 없음")
-
-# ---- 주가 / 손익률 추이 차트 ----
-st.divider()
-st.subheader("수익 현황 추이")
-
-history_df = load_history()
-if history_df.empty:
-    st.info("차트를 표시할 이력 데이터가 아직 없습니다. '현재 시간 반영'을 눌러 데이터를 쌓아주세요.")
-else:
-    x = pd.to_datetime(history_df["시각"])
-
-    fig_price = go.Figure()
-    fig_price.add_trace(go.Scatter(
-        x=x, y=history_df["SK하이닉스가격"], mode="lines+markers", name="SK하이닉스",
-    ))
-    fig_price.add_hline(y=target_price, line_dash="dash", line_color="green", annotation_text="목표가")
-    fig_price.add_hline(y=stop_loss_price, line_dash="dash", line_color="red", annotation_text="손절가")
-    fig_price.add_hline(y=AVG_PRICE, line_dash="dash", line_color="gray", annotation_text="평단가")
-    fig_price.update_layout(title="SK하이닉스 주가 추이", xaxis_title="시각", yaxis_title="가격(원)", height=400)
-    st.plotly_chart(fig_price)
-
-    fig_pnl = go.Figure()
-    fig_pnl.add_trace(go.Scatter(
-        x=x, y=history_df["손익률"], mode="lines+markers", name="손익률(%)",
-    ))
-    fig_pnl.update_layout(title="손익률 추이", xaxis_title="시각", yaxis_title="손익률(%)", height=300)
-    st.plotly_chart(fig_pnl)
 
 # ---- 매수 기록 관리 ----
 st.divider()
@@ -721,26 +711,15 @@ with st.form("trade_form", clear_on_submit=True):
         st.rerun()
 
 with st.expander("매수 기록 전체 보기"):
-    st.dataframe(trades_df, width="stretch", hide_index=True)
+    st.dataframe(style_df(trades_df), width="stretch", hide_index=True)
     st.download_button(
         label="trades.csv 다운로드",
         data=trades_df.to_csv(index=False).encode("utf-8-sig"),
         file_name="trades.csv",
         mime="text/csv",
     )
-st.caption(
-    "주의: Streamlit Cloud는 재부팅/재배포 시 로컬 파일이 초기화되어 "
-    "이 화면에서 추가한 매수 기록이 사라질 수 있습니다. 주기적으로 다운로드해 백업하세요."
-)
 
-# ---- 매수 스케줄 (계획) ----
-st.divider()
-st.subheader("매수 스케줄 (계획)")
-st.dataframe(pd.DataFrame(SCHEDULE), width="stretch", hide_index=True)
-
-buy_progress = min(SHARES_OWNED / TOTAL_PLAN, 1.0) if TOTAL_PLAN else 0.0
-st.progress(buy_progress, text=f"누적 매수 진행률: {SHARES_OWNED}/{TOTAL_PLAN}주 ({buy_progress * 100:.0f}%)")
-
+# ---- 데이터 표 ----
 df = pd.DataFrame(data["items"])
 
 
@@ -751,14 +730,13 @@ def show_section(title, category):
     if sub.empty:
         st.write("데이터 없음")
     else:
-        st.dataframe(sub, width="stretch", hide_index=True)
+        st.dataframe(style_df(sub), width="stretch", hide_index=True)
 
 
+st.divider()
 show_section("국내 (정규장 + 시간외)", "국내")
-show_section("수급 (외국인/기관/개인 순매수)", "수급")
 
-# ---- 관련주 (정규장 + 시간외 + 괴리) ----
-st.subheader("관련주 (지수보다 우선 참고, 정규장 + 시간외 괴리)")
+st.subheader("관련주 (정규장 + 시간외 괴리)")
 if data["avg_gap"] is not None:
     st.metric("관련주 시간외 괴리 평균", f"{data['avg_gap']:+.2f}%p")
 else:
@@ -779,7 +757,7 @@ else:
             return ["background-color: #fff3b0"] * len(row)
         return [""] * len(row)
 
-    st.dataframe(related_df.style.apply(highlight_gap, axis=1), width="stretch", hide_index=True)
+    st.dataframe(style_df(related_df).apply(highlight_gap, axis=1), width="stretch", hide_index=True)
 
 st.caption(
     "국내 시간외등락률·정규장등락률은 전일종가 기준, 해외 시간외등락률은 "
@@ -788,27 +766,6 @@ st.caption(
 
 show_section("지수", "지수")
 show_section("변동성 / 리스크 지표", "리스크")
-
-# ---- 아시아-미국 순환매 비교 ----
-st.divider()
-st.subheader("아시아-미국 순환매 비교")
-col_asia, col_us = st.columns(2)
-with col_asia:
-    st.write("아시아 지수 (당일 마감 등락률)")
-    asia_df = df[(df["구분"] == "지수") & (df["항목"].isin(ASIA_INDEX_NAMES))][["항목", "현재가", "등락률(%)"]]
-    if asia_df.empty:
-        st.write("데이터 없음")
-    else:
-        st.dataframe(asia_df, width="stretch", hide_index=True)
-with col_us:
-    st.write("미국 관련주 (시간외 등락률)")
-    if related_df.empty or "시간외등락률(%)" not in related_df.columns:
-        st.write("데이터 없음")
-    else:
-        st.dataframe(
-            related_df[["항목", "시간외구분", "시간외등락률(%)"]],
-            width="stretch", hide_index=True,
-        )
 
 # ---- 관련 뉴스 ----
 st.divider()
@@ -821,18 +778,6 @@ for q in NEWS_QUERIES:
     else:
         for n in news_items:
             st.markdown(f"- [{n['제목']}]({n['링크']}) &nbsp;·&nbsp; {n['시각']}")
-
-# ---- 알림 로그 ----
-st.divider()
-st.subheader("알림 로그")
-with st.expander("지금까지 발생한 알림 보기"):
-    if os.path.exists(ALERT_LOG_PATH):
-        try:
-            st.dataframe(pd.read_csv(ALERT_LOG_PATH), width="stretch", hide_index=True)
-        except Exception:
-            st.write("알림 로그를 읽는 데 실패했습니다.")
-    else:
-        st.write("아직 기록된 알림이 없습니다.")
 
 # ---- 스냅샷 다운로드 ----
 st.divider()
