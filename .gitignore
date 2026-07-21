@@ -1,7 +1,10 @@
 latest_snapshot.json
 history_log.csv
+trades.csv
+alert_history.csv
 news_test.txt
 news_test2.txt
+naver_poll_test.json
 __pycache__/
 *.pyc
 .venv/
