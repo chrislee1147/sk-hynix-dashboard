@@ -7,12 +7,19 @@ SK하이닉스 투자 모니터링 대시보드 (Streamlit)
 import datetime as dt
 import json
 import os
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
 import streamlit as st
 import yfinance as yf
 from bs4 import BeautifulSoup
+
+KST = ZoneInfo("Asia/Seoul")
+
+
+def now_kst():
+    return dt.datetime.now(KST)
 
 # ========================= CONFIG =========================
 
@@ -95,7 +102,7 @@ def fetch_pykrx(code):
     """pykrx 일별 데이터 폴백 (실시간 아님, 최근 종가 기준)."""
     from pykrx import stock
 
-    today = dt.date.today()
+    today = now_kst().date()
     fromdate = (today - dt.timedelta(days=15)).strftime("%Y%m%d")
     todate = today.strftime("%Y%m%d")
     df = stock.get_market_ohlcv_by_date(fromdate, todate, code)
@@ -143,7 +150,7 @@ def fetch_yf(ticker):
 # ========================= 전체 데이터 수집 + 알림 판정 =========================
 
 def collect_all():
-    collected_at = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    collected_at = now_kst().strftime("%Y-%m-%d %H:%M:%S (KST)")
     items = []
     alerts = []
 
@@ -274,7 +281,7 @@ def collect_all():
         mark("VIX", "변동성경고")
 
     earnings_date = dt.date.fromisoformat(EARNINGS_DATE)
-    dday = (earnings_date - dt.date.today()).days
+    dday = (earnings_date - now_kst().date()).days
     if 0 <= dday <= EARNINGS_DDAY_WARNING:
         alerts.append(f"매수 자제 구간 안내: 실적발표({EARNINGS_DATE})까지 D-{dday}")
 
@@ -320,7 +327,7 @@ with col_btn:
 data = st.session_state["data"]
 
 with col_time:
-    st.write(f"현재 시각: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    st.write(f"현재 시각: {now_kst().strftime('%Y-%m-%d %H:%M:%S')} (KST)")
     st.write(f"마지막 갱신 시각: {data['collected_at']}")
 
 # ---- 상단 요약 ----
