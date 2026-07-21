@@ -40,25 +40,32 @@ DOMESTIC = {
     "삼성전자": "005930",
 }
 
-US_RELATED_CORE = {
+US_RELATED = {
     "마이크론(MU)": "MU",
     "샌디스크(SNDK)": "SNDK",
     "웨스턴디지털(WDC)": "WDC",
     "SK하이닉스 ADR": "SKHY",  # 2026-07-10 나스닥 상장 (구 OTC 티커 HXSCL 폐지)
-}
-
-US_RELATED_EXTRA = {
     "AMD": "AMD",
     "엔비디아(NVDA)": "NVDA",
+    "마벨(MRVL)": "MRVL",
+    "테라다인(TER)": "TER",
 }
+# "관련주 신호 발생" 등락률 알림은 최초 요청대로 이 4종목 평균만 사용
+US_RELATED_ALERT_SET = ["마이크론(MU)", "샌디스크(SNDK)", "웨스턴디지털(WDC)", "SK하이닉스 ADR"]
+
+GAP_ALERT_THRESHOLD = 3  # 시간외 괴리 평균 알림 기준(%p)
+GAP_HIGHLIGHT_THRESHOLD = 3  # 표 하이라이트 기준(%p)
 
 INDICES = {
     "코스피": "^KS11",
     "코스닥": "^KQ11",
+    "닛케이225": "^N225",
+    "상해종합": "000001.SS",
     "나스닥종합": "^IXIC",
     "S&P500": "^GSPC",
     "필라델피아반도체(SOX)": "^SOX",
 }
+ASIA_INDEX_NAMES = ["코스피", "코스닥", "닛케이225", "상해종합"]
 
 RISK_INDICATORS = {
     "VIX": "^VIX",
@@ -328,17 +335,24 @@ def collect_all(avg_price, shares_owned):
                 "알림": f"수집실패: {e}",
             })
 
-    # 관련주 (핵심, 정규장 + 시간외)
-    for name, ticker in US_RELATED_CORE.items():
+    # 관련주 (정규장 + 시간외 + 괴리)
+    related_gaps = {}
+    for name, ticker in US_RELATED.items():
         try:
             price, pct, amt, ext_price, ext_pct, ext_label = fetch_yf_extended(ticker)
-            us_related_pct[name] = pct
+            if name in US_RELATED_ALERT_SET:
+                us_related_pct[name] = pct
+            gap = None
+            if ext_pct is not None:
+                gap = round(ext_pct - pct, 2)
+                related_gaps[name] = gap
             items.append({
                 "구분": "관련주", "항목": name, "현재가": round(price, 2),
                 "등락률(%)": round(pct, 2), "등락폭": round(amt, 2),
                 "시간외구분": ext_label or "-",
                 "시간외가": round(ext_price, 2) if ext_price is not None else None,
                 "시간외등락률(%)": round(ext_pct, 2) if ext_pct is not None else None,
+                "괴리(%p)": gap,
                 "출처": "yfinance", "알림": "",
             })
         except Exception as e:
@@ -346,26 +360,7 @@ def collect_all(avg_price, shares_owned):
                 "구분": "관련주", "항목": name, "현재가": None,
                 "등락률(%)": None, "등락폭": None,
                 "시간외구분": "-", "시간외가": None, "시간외등락률(%)": None,
-                "출처": "데이터 없음", "알림": f"수집실패: {e}",
-            })
-
-    # 관련주 (참고, 정규장 + 시간외)
-    for name, ticker in US_RELATED_EXTRA.items():
-        try:
-            price, pct, amt, ext_price, ext_pct, ext_label = fetch_yf_extended(ticker)
-            items.append({
-                "구분": "참고", "항목": name, "현재가": round(price, 2),
-                "등락률(%)": round(pct, 2), "등락폭": round(amt, 2),
-                "시간외구분": ext_label or "-",
-                "시간외가": round(ext_price, 2) if ext_price is not None else None,
-                "시간외등락률(%)": round(ext_pct, 2) if ext_pct is not None else None,
-                "출처": "yfinance", "알림": "",
-            })
-        except Exception as e:
-            items.append({
-                "구분": "참고", "항목": name, "현재가": None,
-                "등락률(%)": None, "등락폭": None,
-                "시간외구분": "-", "시간외가": None, "시간외등락률(%)": None,
+                "괴리(%p)": None,
                 "출처": "데이터 없음", "알림": f"수집실패: {e}",
             })
 
@@ -436,6 +431,19 @@ def collect_all(avg_price, shares_owned):
             for k in us_related_pct:
                 mark(k, "관련주신호")
 
+    avg_gap = None
+    if related_gaps:
+        avg_gap = sum(related_gaps.values()) / len(related_gaps)
+        if abs(avg_gap) >= GAP_ALERT_THRESHOLD:
+            direction = "강세" if avg_gap > 0 else "약세"
+            detail = ", ".join(f"{k} {v:+.2f}%p" for k, v in related_gaps.items())
+            alerts.append(
+                f"관련주 시간외 {direction}, 내일 개장 참고 신호: "
+                f"평균 괴리 {avg_gap:+.2f}%p ({detail})"
+            )
+            for k in related_gaps:
+                mark(k, "시간외괴리")
+
     if vix_price is not None and vix_price >= VIX_WARNING:
         alerts.append(f"변동성 경고: VIX {vix_price:.2f} (기준 {VIX_WARNING} 이상)")
         mark("VIX", "변동성경고")
@@ -468,6 +476,7 @@ def collect_all(avg_price, shares_owned):
         "alerts": alerts,
         "items": items,
         "news": news,
+        "avg_gap": avg_gap,
     }
 
 
@@ -556,6 +565,26 @@ def refresh_data(avg_price, shares_owned):
     return data
 
 
+def check_stop_loss(sk_price, stop_loss_price):
+    """None | 'breach' | 'near' — 순수 함수, 손절가 이탈/근접 여부만 판정."""
+    if sk_price is None:
+        return None
+    if sk_price <= stop_loss_price:
+        return "breach"
+    if sk_price <= stop_loss_price * (1 + STOP_LOSS_NEAR_PCT / 100):
+        return "near"
+    return None
+
+
+def check_target(sk_price, target_price):
+    """None | 'reached' — 순수 함수, 목표가 도달 여부만 판정."""
+    if sk_price is None or target_price <= 0:
+        return None
+    if sk_price >= target_price:
+        return "reached"
+    return None
+
+
 # ========================= UI =========================
 
 st.title("SK하이닉스 투자 모니터링")
@@ -631,9 +660,14 @@ if sk_price is not None:
     progress_clamped = min(max(progress, 0.0), 1.0)
     st.progress(progress_clamped, text=f"평단가→목표가 진행률: {progress * 100:.1f}%")
 
-    if sk_price <= stop_loss_price:
+    target_state = check_target(sk_price, target_price)
+    if target_state == "reached":
+        st.success(f"목표가 도달: 현재가 {sk_price:,.0f}원 ≥ 목표가 {target_price:,.0f}원")
+
+    stop_state = check_stop_loss(sk_price, stop_loss_price)
+    if stop_state == "breach":
         st.error(f"손절가 이탈: 현재가 {sk_price:,.0f}원 ≤ 손절가 {stop_loss_price:,.0f}원")
-    elif sk_price <= stop_loss_price * (1 + STOP_LOSS_NEAR_PCT / 100):
+    elif stop_state == "near":
         st.warning(
             f"손절 검토 구간: 현재가 {sk_price:,.0f}원 "
             f"(손절가 {stop_loss_price:,.0f}원 +{STOP_LOSS_NEAR_PCT}% 이내)"
@@ -722,10 +756,59 @@ def show_section(title, category):
 
 show_section("국내 (정규장 + 시간외)", "국내")
 show_section("수급 (외국인/기관/개인 순매수)", "수급")
-show_section("관련주 (지수보다 우선 참고, 정규장 + 시간외)", "관련주")
-show_section("참고: 미국 반도체주 (정규장 + 시간외)", "참고")
+
+# ---- 관련주 (정규장 + 시간외 + 괴리) ----
+st.subheader("관련주 (지수보다 우선 참고, 정규장 + 시간외 괴리)")
+if data["avg_gap"] is not None:
+    st.metric("관련주 시간외 괴리 평균", f"{data['avg_gap']:+.2f}%p")
+else:
+    st.write("시간외 괴리 평균: 데이터 없음")
+
+related_df = df[df["구분"] == "관련주"].drop(columns=["구분"]).dropna(axis=1, how="all")
+if related_df.empty:
+    st.write("데이터 없음")
+else:
+    sort_by_gap = st.checkbox("괴리(%p) 절댓값 큰 순으로 정렬")
+    if sort_by_gap and "괴리(%p)" in related_df.columns:
+        order = related_df["괴리(%p)"].abs().sort_values(ascending=False, na_position="last").index
+        related_df = related_df.reindex(order)
+
+    def highlight_gap(row):
+        gap = row.get("괴리(%p)")
+        if pd.notna(gap) and abs(gap) >= GAP_HIGHLIGHT_THRESHOLD:
+            return ["background-color: #fff3b0"] * len(row)
+        return [""] * len(row)
+
+    st.dataframe(related_df.style.apply(highlight_gap, axis=1), width="stretch", hide_index=True)
+
+st.caption(
+    "국내 시간외등락률·정규장등락률은 전일종가 기준, 해외 시간외등락률은 "
+    "정규장 마감가 기준(Yahoo Finance)이라 산출 기준이 다를 수 있습니다."
+)
+
 show_section("지수", "지수")
 show_section("변동성 / 리스크 지표", "리스크")
+
+# ---- 아시아-미국 순환매 비교 ----
+st.divider()
+st.subheader("아시아-미국 순환매 비교")
+col_asia, col_us = st.columns(2)
+with col_asia:
+    st.write("아시아 지수 (당일 마감 등락률)")
+    asia_df = df[(df["구분"] == "지수") & (df["항목"].isin(ASIA_INDEX_NAMES))][["항목", "현재가", "등락률(%)"]]
+    if asia_df.empty:
+        st.write("데이터 없음")
+    else:
+        st.dataframe(asia_df, width="stretch", hide_index=True)
+with col_us:
+    st.write("미국 관련주 (시간외 등락률)")
+    if related_df.empty or "시간외등락률(%)" not in related_df.columns:
+        st.write("데이터 없음")
+    else:
+        st.dataframe(
+            related_df[["항목", "시간외구분", "시간외등락률(%)"]],
+            width="stretch", hide_index=True,
+        )
 
 # ---- 관련 뉴스 ----
 st.divider()
