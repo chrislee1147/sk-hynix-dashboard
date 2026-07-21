@@ -666,19 +666,30 @@ st.caption(
 )
 
 # ---- 상단 요약 ----
-if sk_price is not None and AVG_PRICE:
-    live_pnl_pct = (sk_price - AVG_PRICE) / AVG_PRICE * 100
-    live_pnl_amt = (sk_price - AVG_PRICE) * SHARES_OWNED
+# 시간외가가 있으면(정규장 마감 이후) 손익 계산 기준을 시간외가로 전환, 없으면 정규장가 사용
+sk_overtime_price = sk_item.get("시간외가") if sk_item else None
+pnl_basis_price = sk_overtime_price if sk_overtime_price is not None else sk_price
+pnl_basis_label = "시간외 기준" if sk_overtime_price is not None else "정규장 기준"
+
+if pnl_basis_price is not None and AVG_PRICE:
+    live_pnl_pct = (pnl_basis_price - AVG_PRICE) / AVG_PRICE * 100
+    live_pnl_amt = (pnl_basis_price - AVG_PRICE) * SHARES_OWNED
 else:
     live_pnl_pct = None
     live_pnl_amt = None
 
 m2, m3, m4 = st.columns(3)
-m2.metric("평단가 대비 손익률", f"{live_pnl_pct:+.2f}%" if live_pnl_pct is not None else "N/A")
-m3.metric(f"평가손익(보유 {SHARES_OWNED}주 기준)", f"{live_pnl_amt:+,.0f}원" if live_pnl_amt is not None else "N/A")
+m2.metric(f"평단가 대비 손익률 ({pnl_basis_label})", f"{live_pnl_pct:+.2f}%" if live_pnl_pct is not None else "N/A")
+m3.metric(
+    f"평가손익 ({pnl_basis_label}, 보유 {SHARES_OWNED}주)",
+    f"{live_pnl_amt:+,.0f}원" if live_pnl_amt is not None else "N/A",
+)
 m4.metric("실적발표 D-day", f"D-{data['dday']}" if data['dday'] >= 0 else f"D+{-data['dday']}")
 
-st.caption(f"평단가 {AVG_PRICE:,}원 / 보유 {SHARES_OWNED}주 (총 계획 {TOTAL_PLAN}주) / 실적발표일 {EARNINGS_DATE}")
+summary_caption = f"평단가 {AVG_PRICE:,}원 / 보유 {SHARES_OWNED}주 (총 계획 {TOTAL_PLAN}주) / 실적발표일 {EARNINGS_DATE}"
+if pnl_basis_price is not None:
+    summary_caption += f" / 손익 계산 기준가: {pnl_basis_price:,.0f}원 ({pnl_basis_label})"
+st.caption(summary_caption)
 
 # ---- 알림 배너 ----
 if data["alerts"]:
