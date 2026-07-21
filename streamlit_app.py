@@ -616,6 +616,30 @@ with col_time:
     st.write(f"현재 시각: {now_kst().strftime('%Y-%m-%d %H:%M:%S')} (KST)")
     st.write(f"마지막 갱신 시각: {data['collected_at']}")
 
+# ---- SK하이닉스 정규장가 / 시간외가 (최우선 표시) ----
+sk_item = next((it for it in data["items"] if it["항목"] == "SK하이닉스"), None)
+
+col_reg, col_ot = st.columns(2)
+with col_reg:
+    if sk_item and sk_item["현재가"] is not None:
+        st.metric(
+            "SK하이닉스 정규장가",
+            f"{sk_item['현재가']:,.0f}원",
+            f"{sk_item['등락률(%)']:+.2f}%",
+        )
+    else:
+        st.metric("SK하이닉스 정규장가", "N/A")
+with col_ot:
+    if sk_item and sk_item.get("시간외가") is not None:
+        st.metric(
+            "SK하이닉스 시간외가",
+            f"{sk_item['시간외가']:,.0f}원",
+            f"{sk_item['시간외등락률(%)']:+.2f}%",
+        )
+    else:
+        st.metric("SK하이닉스 시간외가", "데이터 없음")
+    st.caption(sk_item.get("시간외상태", "") if sk_item else "")
+
 # ---- 시간외 세션 여부 ----
 session = get_session_status()
 col_sess1, col_sess2 = st.columns(2)
@@ -649,8 +673,7 @@ else:
     live_pnl_pct = None
     live_pnl_amt = None
 
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("SK하이닉스 현재가", f"{sk_price:,.0f}원" if sk_price is not None else "N/A")
+m2, m3, m4 = st.columns(3)
 m2.metric("평단가 대비 손익률", f"{live_pnl_pct:+.2f}%" if live_pnl_pct is not None else "N/A")
 m3.metric(f"평가손익(보유 {SHARES_OWNED}주 기준)", f"{live_pnl_amt:+,.0f}원" if live_pnl_amt is not None else "N/A")
 m4.metric("실적발표 D-day", f"D-{data['dday']}" if data['dday'] >= 0 else f"D+{-data['dday']}")
