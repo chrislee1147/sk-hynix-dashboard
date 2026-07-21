@@ -126,14 +126,20 @@ def fetch_naver(code):
     else:
         status = over.get("overMarketStatus")
         session_type = over.get("tradingSessionType", "-")
-        if status == "OPEN" and over.get("overPrice"):
+        if over.get("overPrice"):
+            # 세션이 끝난(CLOSE) 뒤에도 API가 마지막 시간외 체결가를 계속 제공하므로
+            # OPEN 여부와 무관하게 그 값을 그대로 보여준다 (진행중/마감 라벨만 구분).
             overtime_price = to_num(over["overPrice"])
             overtime_pct = to_num(over.get("fluctuationsRatio", 0))
             if over.get("compareToPreviousPrice", {}).get("name") == "FALLING":
                 overtime_pct = -abs(overtime_pct)
-            overtime_status = f"진행중({session_type})"
+            traded_at = over.get("localTradedAt", "")
+            if status == "OPEN":
+                overtime_status = f"진행중({session_type}, {traded_at})"
+            else:
+                overtime_status = f"마감({session_type}, 마지막 체결 {traded_at})"
         else:
-            overtime_status = f"세션 종료/휴장(overMarketStatus={status})"
+            overtime_status = f"시간외 가격 없음(overMarketStatus={status})"
 
     return price, change_pct, change_amt, "naver", overtime_price, overtime_pct, overtime_status
 
