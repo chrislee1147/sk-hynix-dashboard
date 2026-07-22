@@ -130,7 +130,12 @@ def fetch_naver(code):
         traded_date = traded_at[:10] if traded_at else None
         today_str = now_kst().strftime("%Y-%m-%d")
 
-        if over.get("overPrice") and traded_date == today_str:
+        # 네이버 API는 정규장 중에도 overMarketPriceInfo를 채워서 주는데, 이때
+        # tradingSessionType이 REGULAR_MARKET이라 시간외가 아니라 정규장가와 동일하다.
+        # 실제 시간외(장전/장후 단일가)만 골라내려면 세션 종류를 반드시 확인해야 한다.
+        is_overtime_session = session_type in ("AFTER_MARKET", "BEFORE_MARKET")
+
+        if over.get("overPrice") and traded_date == today_str and is_overtime_session:
             # 세션이 끝난(CLOSE) 뒤에도 API가 마지막 시간외 체결가를 계속 제공하므로
             # OPEN 여부와 무관하게 값을 보여주되, 오늘 날짜 체결이 아니면(전일 잔여 데이터)
             # 장중에 잘못 섞이지 않도록 제외한다.
@@ -142,6 +147,8 @@ def fetch_naver(code):
                 overtime_status = f"진행중({session_type}, {traded_at})"
             else:
                 overtime_status = f"마감({session_type}, 마지막 체결 {traded_at})"
+        elif over.get("overPrice") and not is_overtime_session:
+            overtime_status = f"정규장 데이터라 시간외 아님(세션타입={session_type}, 제외함)"
         elif over.get("overPrice") and traded_date != today_str:
             overtime_status = f"오늘자 시간외 데이터 아님(제외함, 마지막 체결 {traded_at})"
         else:
