@@ -1,5 +1,6 @@
 latest_snapshot.json
 trades.csv
+overtime_cache.json
 HANDOFF.md
 __pycache__/
 *.pyc

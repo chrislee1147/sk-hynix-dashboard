@@ -29,7 +29,7 @@ def now_kst():
 # ========================= CONFIG =========================
 
 TOTAL_PLAN = 10
-EARNINGS_DATE = "2026-07-24"
+EARNINGS_DATE = "2026-07-29"  # 확정: 오전 9시 Conference Call
 
 BUY_REVIEW_PRICE = 1_760_000
 RISK_WARNING_PRICE = 1_500_000
@@ -94,6 +94,11 @@ SEED_TRADES = [
     {"날짜": "2026-07-21", "수량": 1, "매수가": 1_817_000},
 ]
 
+# 국내는 로그인 없이 조회 가능한 과거 시간외 이력 소스가 없어(네이버 실시간 API는
+# 정규장 중엔 어제 시간외 정보를 전혀 돌려주지 않음, 직접 확인됨), 이 앱이 실제로
+# 라이브 시간외가를 관측할 때마다 여기 캐시해두고 없을 때 최근값으로 재사용한다.
+OVERTIME_CACHE_PATH = os.path.join(os.path.dirname(__file__), "overtime_cache.json")
+
 st.set_page_config(page_title="SK하이닉스 투자 모니터링", layout="wide")
 
 
@@ -120,6 +125,7 @@ def fetch_naver(code):
 
     overtime_price = None
     overtime_pct = None
+    overtime_traded_at = None
     over = item.get("overMarketPriceInfo")
     if over is None:
         overtime_status = "시간외 정보 없음(API 응답에 필드 자체가 없음)"
@@ -143,6 +149,7 @@ def fetch_naver(code):
             overtime_pct = to_num(over.get("fluctuationsRatio", 0))
             if over.get("compareToPreviousPrice", {}).get("name") == "FALLING":
                 overtime_pct = -abs(overtime_pct)
+            overtime_traded_at = traded_at
             if status == "OPEN":
                 overtime_status = f"진행중({session_type}, {traded_at})"
             else:
@@ -154,7 +161,7 @@ def fetch_naver(code):
         else:
             overtime_status = f"시간외 가격 없음(overMarketStatus={status})"
 
-    return price, change_pct, change_amt, "naver", overtime_price, overtime_pct, overtime_status
+    return price, change_pct, change_amt, "naver", overtime_price, overtime_pct, overtime_status, overtime_traded_at
 
 
 def fetch_pykrx(code):
@@ -171,7 +178,7 @@ def fetch_pykrx(code):
     prev_close = float(df["종가"].iloc[-2])
     change_amt = close - prev_close
     change_pct = change_amt / prev_close * 100
-    return close, change_pct, change_amt, "pykrx(일별)", None, None, "pykrx 폴백 사용(시간외 데이터 미제공)"
+    return close, change_pct, change_amt, "pykrx(일별)", None, None, "pykrx 폴백 사용(시간외 데이터 미제공)", None
 
 
 def fetch_domestic(code):
@@ -179,6 +186,37 @@ def fetch_domestic(code):
         return fetch_naver(code)
     except Exception:
         return fetch_pykrx(code)
+
+
+def load_overtime_cache():
+    if not os.path.exists(OVERTIME_CACHE_PATH):
+        return {}
+    try:
+        with open(OVERTIME_CACHE_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_overtime_cache(cache):
+    try:
+        with open(OVERTIME_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass  # 클라우드 등 쓰기 불가 환경에서는 조용히 무시
+
+
+def format_iso_to_kst(iso_str):
+    """ISO 타임스탬프 문자열을 'YYYY-MM-DD HH:MM' KST 표기로 변환. 실패 시 원문 반환."""
+    if not iso_str:
+        return "시각 불명"
+    try:
+        d = dt.datetime.fromisoformat(iso_str)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=KST)
+        return d.astimezone(KST).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return iso_str
 
 
 def fetch_investor_flows(code):
@@ -234,7 +272,8 @@ def fetch_yf(ticker):
 
 
 def _fetch_extended_via_info(ticker):
-    """1차 방법: yfinance Ticker.info의 marketState/preMarketPrice/postMarketPrice 사용."""
+    """1차 방법: yfinance Ticker.info의 marketState/preMarketPrice/postMarketPrice 사용.
+    지금 당장 진행 중인 시간외가만 반환한다(과거 값 조회는 _fetch_extended_via_history 담당)."""
     t = yf.Ticker(ticker)
     info = t.info
 
@@ -250,20 +289,27 @@ def _fetch_extended_via_info(ticker):
 
     ext_price = None
     ext_pct = None
+    ext_traded_at = None
     state = info.get("marketState")
 
     if state == "PRE":
         if info.get("preMarketPrice") is not None:
             ext_price = float(info["preMarketPrice"])
             ext_pct = info.get("preMarketChangePercent")
-            ext_label = "프리마켓(info)"
+            ext_label = "프리마켓(info, 진행중)"
+            epoch = info.get("preMarketTime")
+            if epoch:
+                ext_traded_at = dt.datetime.fromtimestamp(epoch, tz=dt.timezone.utc).astimezone(NY_TZ).isoformat()
         else:
             ext_label = "프리마켓(info, 가격 데이터 없음)"
     elif state in ("POST", "POSTPOST"):
         if info.get("postMarketPrice") is not None:
             ext_price = float(info["postMarketPrice"])
             ext_pct = info.get("postMarketChangePercent")
-            ext_label = "애프터마켓(info)"
+            ext_label = "애프터마켓(info, 진행중)"
+            epoch = info.get("postMarketTime")
+            if epoch:
+                ext_traded_at = dt.datetime.fromtimestamp(epoch, tz=dt.timezone.utc).astimezone(NY_TZ).isoformat()
         else:
             ext_label = "애프터마켓(info, 가격 데이터 없음)"
     elif state == "REGULAR":
@@ -275,16 +321,17 @@ def _fetch_extended_via_info(ticker):
     else:
         ext_label = f"상태불명(info, marketState={state})"
 
-    return price, change_pct, change_amt, ext_price, ext_pct, ext_label
+    return price, change_pct, change_amt, ext_price, ext_pct, ext_label, ext_traded_at
 
 
 def _fetch_extended_via_history(ticker):
-    """2차 방법(폴백): Ticker.history(1분봉, prepost=True)의 마지막 봉으로 시간외가 판정.
-    정규장 등락은 이미 검증된 fetch_yf()를 그대로 사용."""
+    """최근 5일치 1분봉(prepost=True)에서 정규장 시간대(09:30~16:00 ET, 평일)가 아닌
+    가장 최근 봉을 찾아 시간외가로 사용한다. 지금 당장 진행 중인 세션이 아니어도
+    '최근 기준'으로 반환하며, 그 봉의 체결 시각(NY 기준)을 항상 함께 반환한다."""
     price, change_pct, change_amt = fetch_yf(ticker)
 
     t = yf.Ticker(ticker)
-    hist = t.history(period="1d", interval="1m", prepost=True)
+    hist = t.history(period="5d", interval="1m", prepost=True)
     if hist is None or hist.empty:
         raise ValueError("1분봉 데이터 없음(history)")
 
@@ -292,32 +339,63 @@ def _fetch_extended_via_history(ticker):
     if idx.tz is None:
         idx = idx.tz_localize("UTC")
     idx_ny = idx.tz_convert(NY_TZ)
-    last_time = idx_ny[-1].time()
-    last_close = float(hist["Close"].iloc[-1])
 
-    if last_time >= US_AFTERHOURS_START:
-        label = "애프터마켓(history)"
-    elif last_time < US_REGULAR_START:
-        label = "프리마켓(history)"
-    else:
-        return price, change_pct, change_amt, None, None, "정규장 중(history, 시간외 없음)"
+    last_i = None
+    for i in range(len(idx_ny) - 1, -1, -1):
+        t_ny = idx_ny[i]
+        if t_ny.weekday() >= 5:
+            continue
+        tm = t_ny.time()
+        if tm < US_REGULAR_START or tm >= US_REGULAR_END:
+            last_i = i
+            break
 
+    if last_i is None:
+        return price, change_pct, change_amt, None, None, "시간외 데이터 없음(최근 5일 이내 프리/애프터마켓 봉 없음)", None
+
+    t_ny = idx_ny[last_i]
+    last_close = float(hist["Close"].iloc[last_i])
     ext_pct = (last_close - price) / price * 100 if price else None
-    return price, change_pct, change_amt, last_close, ext_pct, label
+
+    now_ny = dt.datetime.now(NY_TZ)
+    is_live = t_ny.date() == now_ny.date() and (now_ny - t_ny.to_pydatetime()).total_seconds() < 300
+    session_name = "프리마켓" if t_ny.time() < US_REGULAR_START else "애프터마켓"
+    ts_display = t_ny.strftime("%Y-%m-%d %H:%M ET")
+    if is_live:
+        label = f"{session_name}(history, 진행중, {ts_display})"
+    else:
+        label = f"{session_name}(history, 최근 기준 {ts_display})"
+
+    return price, change_pct, change_amt, last_close, ext_pct, label, t_ny.isoformat()
 
 
 def fetch_yf_extended(ticker):
-    """정규장 등락 + 시간외(프리마켓/애프터마켓).
-    info 방식을 먼저 시도하고 실패하면 history 방식으로 폴백한다.
-    실패/무데이터 사유는 항상 ext_label에 담아 화면에 그대로 노출한다."""
+    """정규장 등락 + 시간외(프리마켓/애프터마켓) 가격, 그 체결 시각, 캐시(과거값) 여부.
+    지금 당장 진행 중인 시간외가 있으면 그 값을(is_cached=False), 없으면 최근 5일 이내
+    가장 최근 프리/애프터마켓 값을 '최근 기준'으로(is_cached=True) 반환한다.
+    반환: price, change_pct, change_amt, ext_price, ext_pct, ext_label, ext_traded_at, is_cached"""
+    info_error = None
+    price = change_pct = change_amt = ext_price = ext_pct = ext_traded_at = None
+    ext_label = None
     try:
-        return _fetch_extended_via_info(ticker)
-    except Exception as e_info:
-        try:
-            price, change_pct, change_amt, ext_price, ext_pct, ext_label = _fetch_extended_via_history(ticker)
-            return price, change_pct, change_amt, ext_price, ext_pct, f"{ext_label} [info 실패로 대체: {e_info}]"
-        except Exception as e_hist:
-            raise ValueError(f"info 실패({e_info}) / history 실패({e_hist})")
+        price, change_pct, change_amt, ext_price, ext_pct, ext_label, ext_traded_at = _fetch_extended_via_info(ticker)
+    except Exception as e:
+        info_error = e
+
+    if ext_price is not None:
+        return price, change_pct, change_amt, ext_price, ext_pct, ext_label, ext_traded_at, False
+
+    try:
+        h_price, h_change_pct, h_change_amt, h_ext_price, h_ext_pct, h_label, h_traded_at = _fetch_extended_via_history(ticker)
+    except Exception as e_hist:
+        if price is None:
+            raise ValueError(f"info 실패({info_error}) / history 실패({e_hist})")
+        return price, change_pct, change_amt, None, None, f"{ext_label}(최근 시간외 조회도 실패: {e_hist})", None, False
+
+    final_price = price if price is not None else h_price
+    final_change_pct = change_pct if price is not None else h_change_pct
+    final_change_amt = change_amt if price is not None else h_change_amt
+    return final_price, final_change_pct, final_change_amt, h_ext_price, h_ext_pct, h_label, h_traded_at, (h_ext_price is not None)
 
 
 def fetch_naver_news(query, count=5):
@@ -365,18 +443,38 @@ def collect_all(avg_price, shares_owned):
     us_related_pct = {}
     vix_price = None
 
-    # 국내 (정규장 + 시간외)
+    # 국내 (정규장 + 시간외, 라이브 시간외가 없으면 이 앱이 관측해둔 최근값으로 대체)
+    overtime_cache = load_overtime_cache()
+    overtime_cache_updated = False
     for name, code in DOMESTIC.items():
         try:
-            price, pct, amt, source, ot_price, ot_pct, ot_status = fetch_domestic(code)
+            price, pct, amt, source, ot_price, ot_pct, ot_status, ot_traded_at = fetch_domestic(code)
             if code == "000660":
                 sk_price = price
+
+            is_cached_ot = False
+            if ot_price is not None:
+                overtime_cache[name] = {
+                    "price": ot_price, "pct": ot_pct,
+                    "traded_at": ot_traded_at or now_kst().isoformat(),
+                }
+                overtime_cache_updated = True
+            else:
+                cached = overtime_cache.get(name)
+                if cached:
+                    ot_price = cached["price"]
+                    ot_pct = cached["pct"]
+                    ts_display = format_iso_to_kst(cached["traded_at"])
+                    ot_status = f"최근 기준({ts_display} 마지막 체결) — {ot_status}"
+                    is_cached_ot = True
+
             items.append({
                 "구분": "국내", "항목": name, "현재가": round(price, 2),
                 "등락률(%)": round(pct, 2), "등락폭": round(amt, 2),
                 "시간외상태": ot_status,
                 "시간외가": round(ot_price, 2) if ot_price is not None else None,
                 "시간외등락률(%)": round(ot_pct, 2) if ot_pct is not None else None,
+                "시간외캐시여부": is_cached_ot,
                 "출처": source, "알림": "",
             })
         except Exception as e:
@@ -385,8 +483,11 @@ def collect_all(avg_price, shares_owned):
                 "등락률(%)": None, "등락폭": None,
                 "시간외상태": f"수집실패: {e}",
                 "시간외가": None, "시간외등락률(%)": None,
+                "시간외캐시여부": False,
                 "출처": "실패", "알림": f"수집실패: {e}",
             })
+    if overtime_cache_updated:
+        save_overtime_cache(overtime_cache)
 
     # 투자자별 매매동향 (외국인/기관 순매매수량, 주 — 네이버 증권, 로그인 불필요)
     investor_flows = {}
@@ -397,17 +498,21 @@ def collect_all(avg_price, shares_owned):
         except Exception as e:
             investor_flows[name] = {"basis_date": None, "values": {}, "error": str(e)}
 
-    # 관련주 (정규장 + 시간외 + 괴리)
+    # 관련주 (정규장 + 시간외 + 괴리, 라이브 시간외가 없으면 최근 5일 이내 최근값을 '최근 기준'으로 표시)
     related_gaps = {}
     for name, ticker in US_RELATED.items():
         try:
-            price, pct, amt, ext_price, ext_pct, ext_label = fetch_yf_extended(ticker)
+            price, pct, amt, ext_price, ext_pct, ext_label, ext_traded_at, ext_is_cached = fetch_yf_extended(ticker)
             if name in US_RELATED_ALERT_SET:
                 us_related_pct[name] = pct
             gap = None
             if ext_pct is not None:
                 gap = round(ext_pct - pct, 2)
-                related_gaps[name] = gap
+                # 며칠 지난 과거 시간외가와 오늘 정규장가를 비교한 괴리는 표에는 참고로
+                # 보여주되, "시간외 강세/약세" 알림처럼 당일 신호로 쓰이는 평균 계산에는
+                # 라이브(오늘 진행 중) 값만 포함해 알림이 과거 데이터로 오도되지 않게 한다.
+                if not ext_is_cached:
+                    related_gaps[name] = gap
             items.append({
                 "구분": "관련주", "항목": name, "현재가": round(price, 2),
                 "등락률(%)": round(pct, 2), "등락폭": round(amt, 2),
@@ -415,6 +520,7 @@ def collect_all(avg_price, shares_owned):
                 "시간외가": round(ext_price, 2) if ext_price is not None else None,
                 "시간외등락률(%)": round(ext_pct, 2) if ext_pct is not None else None,
                 "괴리(%p)": gap,
+                "시간외캐시여부": ext_is_cached,
                 "출처": "yfinance", "알림": "",
             })
         except Exception as e:
@@ -422,7 +528,7 @@ def collect_all(avg_price, shares_owned):
                 "구분": "관련주", "항목": name, "현재가": None,
                 "등락률(%)": None, "등락폭": None,
                 "시간외구분": f"수집실패: {e}", "시간외가": None, "시간외등락률(%)": None,
-                "괴리(%p)": None,
+                "괴리(%p)": None, "시간외캐시여부": False,
                 "출처": "데이터 없음", "알림": f"수집실패: {e}",
             })
 
@@ -713,10 +819,14 @@ st.caption(
 )
 
 # ---- 상단 요약 ----
-# 시간외가가 있으면(정규장 마감 이후) 손익 계산 기준을 시간외가로 전환, 없으면 정규장가 사용
-sk_overtime_price = sk_item.get("시간외가") if sk_item else None
-pnl_basis_price = sk_overtime_price if sk_overtime_price is not None else sk_price
-pnl_basis_label = "시간외 기준" if sk_overtime_price is not None else "정규장 기준"
+# 손익 계산은 '지금 진행 중이거나 오늘 마감된 라이브 시간외가'가 있을 때만 그 값으로
+# 전환한다. 화면 상단 메트릭에는 캐시된(며칠 지난) 최근 시간외가도 참고로 보여주지만,
+# 그 값으로 손익을 계산하면 과거 가격을 오늘 손익인 것처럼 보여주는 오류가 되므로 제외한다.
+sk_overtime_price_live = (
+    sk_item.get("시간외가") if sk_item and not sk_item.get("시간외캐시여부") else None
+)
+pnl_basis_price = sk_overtime_price_live if sk_overtime_price_live is not None else sk_price
+pnl_basis_label = "시간외 기준" if sk_overtime_price_live is not None else "정규장 기준"
 
 if pnl_basis_price is not None and AVG_PRICE:
     live_pnl_pct = (pnl_basis_price - AVG_PRICE) / AVG_PRICE * 100
@@ -810,10 +920,20 @@ with st.expander("매수 기록 전체 보기"):
 df = pd.DataFrame(data["items"])
 
 
+def relabel_cache_flag(sub):
+    """'시간외캐시여부'(bool, 내부 로직용)를 표시용 한글 라벨 컬럼으로 변환."""
+    if "시간외캐시여부" in sub.columns:
+        sub = sub.copy()
+        sub["시간외가 구분"] = sub["시간외캐시여부"].map({True: "최근 기준(과거)", False: "실시간"})
+        sub = sub.drop(columns=["시간외캐시여부"])
+    return sub
+
+
 def show_section(title, category):
     st.subheader(title)
     sub = df[df["구분"] == category].drop(columns=["구분"])
     sub = sub.dropna(axis=1, how="all")
+    sub = relabel_cache_flag(sub)
     if sub.empty:
         st.write("데이터 없음")
     else:
@@ -873,11 +993,25 @@ for name in DOMESTIC:
         max_key = max(vals, key=lambda k: abs(vals[k]))
         st.caption(f"{name}: 절댓값 기준 최대 매매주체 = {max_key} ({vals[max_key]:+,.0f}주)")
 
+with st.expander("확보하지 못한 항목 (개인 / 기관 세부 / 기타법인)"):
+    st.markdown(
+        "요청된 항목 중 아래는 로그인 없이 가져올 수 있는 데이터 소스가 없어 "
+        "**데이터 없음**입니다: 개인, 기타법인, 기관 세부(금융투자·보험·투신·사모펀드·"
+        "은행·기타금융·연기금등·국가지자체)\n\n"
+        "확인한 내용:\n"
+        "- 네이버 증권(finance.naver.com/item/frgn.naver) 페이지는 외국인/기관(합계)만 "
+        "제공하며, 위 세부 항목 자체가 이 페이지에 존재하지 않습니다.\n"
+        "- pykrx의 `get_market_trading_value_by_investor()`는 위 세부 항목을 반환할 수 "
+        "있지만, 실제로 로그인 없이 호출을 테스트한 결과 KRX 서버(data.krx.co.kr)가 "
+        "비로그인 요청을 HTTP 400 응답(`LOGOUT`)으로 명시적으로 거부하는 것을 직접 "
+        "확인했습니다. 즉 pykrx의 문제가 아니라 KRX 서버 자체가 로그인을 요구합니다."
+    )
+
 st.subheader("관련주 (정규장 + 시간외 괴리)")
 if data["avg_gap"] is not None:
-    st.metric("관련주 시간외 괴리 평균", f"{data['avg_gap']:+.2f}%p")
+    st.metric("관련주 시간외 괴리 평균 (실시간 시간외만 집계)", f"{data['avg_gap']:+.2f}%p")
 else:
-    st.write("시간외 괴리 평균: 데이터 없음")
+    st.write("시간외 괴리 평균 (실시간): 데이터 없음")
 
 related_df = df[df["구분"] == "관련주"].drop(columns=["구분"]).dropna(axis=1, how="all")
 if related_df.empty:
@@ -888,17 +1022,21 @@ else:
         order = related_df["괴리(%p)"].abs().sort_values(ascending=False, na_position="last").index
         related_df = related_df.reindex(order)
 
+    related_df_display = relabel_cache_flag(related_df)
+
     def highlight_gap(row):
         gap = row.get("괴리(%p)")
         if pd.notna(gap) and abs(gap) >= GAP_HIGHLIGHT_THRESHOLD:
             return ["background-color: #fff3b0"] * len(row)
         return [""] * len(row)
 
-    st.dataframe(style_df(related_df).apply(highlight_gap, axis=1), width="stretch", hide_index=True)
+    st.dataframe(style_df(related_df_display).apply(highlight_gap, axis=1), width="stretch", hide_index=True)
 
 st.caption(
-    "국내 시간외등락률·정규장등락률은 전일종가 기준, 해외 시간외등락률은 "
-    "정규장 마감가 기준(Yahoo Finance)이라 산출 기준이 다를 수 있습니다."
+    "\"시간외가 구분\"이 '최근 기준(과거)'인 종목은 지금 진행 중인 시간외 세션이 없어 "
+    "최근 5일 이내 마지막 프리/애프터마켓 값을 보여준 것으로, 괴리(%p) 평균 알림에는 "
+    "포함되지 않습니다. 국내 시간외등락률·정규장등락률은 전일종가 기준, 해외 "
+    "시간외등락률은 정규장 마감가 기준(Yahoo Finance)이라 산출 기준이 다를 수 있습니다."
 )
 
 show_section("지수", "지수")
