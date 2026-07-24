@@ -90,8 +90,8 @@ SNAPSHOT_PATH = os.path.join(os.path.dirname(__file__), "latest_snapshot.json")
 
 TRADES_PATH = os.path.join(os.path.dirname(__file__), "trades.csv")
 SEED_TRADES = [
-    {"날짜": "2026-07-20", "수량": 2, "매수가": 1_776_000},
-    {"날짜": "2026-07-21", "수량": 1, "매수가": 1_817_000},
+    {"ID": 1, "날짜": "2026-07-20", "수량": 2, "매수가": 1_776_000},
+    {"ID": 2, "날짜": "2026-07-21", "수량": 1, "매수가": 1_817_000},
 ]
 
 # 국내는 로그인 없이 조회 가능한 과거 시간외 이력 소스가 없어(네이버 실시간 API는
@@ -666,15 +666,59 @@ def load_trades():
             pass
         return seed_df
     try:
-        return pd.read_csv(TRADES_PATH)
+        df = pd.read_csv(TRADES_PATH)
     except Exception:
         return pd.DataFrame(SEED_TRADES)
 
+    if "ID" not in df.columns:
+        # 이전 버전(ID 없이 저장된) trades.csv 마이그레이션: 행 순서대로 ID 부여 후 재저장
+        df.insert(0, "ID", range(1, len(df) + 1))
+        try:
+            df.to_csv(TRADES_PATH, index=False, encoding="utf-8-sig")
+        except Exception:
+            pass
+    return df
+
+
+def next_trade_id(trades_df):
+    if trades_df is None or trades_df.empty or "ID" not in trades_df.columns or trades_df["ID"].isna().all():
+        return 1
+    return int(trades_df["ID"].max()) + 1
+
 
 def save_trade(date_str, qty, price):
-    row = pd.DataFrame([{"날짜": date_str, "수량": qty, "매수가": price}])
+    """매수 기록 추가 폼에서 사용: 새 ID를 부여해 한 행 append."""
+    existing = load_trades()
+    new_id = next_trade_id(existing)
+    row = pd.DataFrame([{"ID": new_id, "날짜": date_str, "수량": qty, "매수가": price}])
     header = not os.path.exists(TRADES_PATH)
     row.to_csv(TRADES_PATH, mode="a", header=header, index=False, encoding="utf-8-sig")
+
+
+def save_trades_df(edited_df):
+    """수정/삭제 표(st.data_editor)에서 사용: 전체 표를 통째로 검증 후 덮어쓴다.
+    새로 추가된 행(ID 비어있음)에는 새 ID를 부여하고, 필수값이 빈 행(작성 중인 신규 행 등)은 제외한다."""
+    df = edited_df.copy()
+    if "ID" not in df.columns:
+        df.insert(0, "ID", pd.NA)
+
+    missing_id_mask = df["ID"].isna()
+    if missing_id_mask.any():
+        next_id = next_trade_id(df)
+        for idx in df.index[missing_id_mask]:
+            df.loc[idx, "ID"] = next_id
+            next_id += 1
+
+    df = df.dropna(subset=["날짜", "수량", "매수가"])
+    if df.empty:
+        df = pd.DataFrame(columns=["ID", "날짜", "수량", "매수가"])
+    else:
+        df["ID"] = df["ID"].astype(int)
+        df["수량"] = df["수량"].astype(int)
+        df["매수가"] = df["매수가"].astype(int)
+
+    df.to_csv(TRADES_PATH, index=False, encoding="utf-8-sig")
+    return df
 
 
 def compute_position(trades_df):
@@ -907,8 +951,27 @@ with st.form("trade_form", clear_on_submit=True):
         st.success(f"{trade_date} {trade_qty}주 @ {trade_price:,}원 기록 저장됨")
         st.rerun()
 
-with st.expander("매수 기록 전체 보기"):
-    st.dataframe(style_df(trades_df), width="stretch", hide_index=True)
+with st.expander("매수 기록 전체 보기 / 수정 / 삭제", expanded=False):
+    st.caption("셀을 더블클릭해 값을 고쳐 쓰거나, 행 왼쪽을 선택 후 삭제(휴지통) 아이콘으로 지울 수 있습니다. ID는 자동 부여되며 수정할 수 없습니다.")
+    edited_trades_df = st.data_editor(
+        trades_df,
+        width="stretch",
+        hide_index=True,
+        num_rows="dynamic",
+        disabled=["ID"],
+        column_config={
+            "ID": st.column_config.NumberColumn("ID"),
+            "날짜": st.column_config.TextColumn("날짜", help="YYYY-MM-DD"),
+            "수량": st.column_config.NumberColumn("수량(주)", min_value=1, step=1),
+            "매수가": st.column_config.NumberColumn("매수가(원)", min_value=0, step=1_000),
+        },
+        key="trades_editor",
+    )
+    if st.button("매수 기록 변경사항 저장"):
+        saved_df = save_trades_df(edited_trades_df)
+        st.success(f"매수 기록 {len(saved_df)}건 저장됨")
+        st.rerun()
+
     st.download_button(
         label="trades.csv 다운로드",
         data=trades_df.to_csv(index=False).encode("utf-8-sig"),
