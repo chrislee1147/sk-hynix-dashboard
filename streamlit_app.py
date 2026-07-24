@@ -181,54 +181,28 @@ def fetch_domestic(code):
         return fetch_pykrx(code)
 
 
-def get_secret(name):
-    """환경변수 우선, 없으면 Streamlit Cloud Secrets(st.secrets)에서 조회.
-    st.secrets에서 찾으면 pykrx 내부가 os.environ을 직접 읽으므로 env에도 채워둔다."""
-    val = os.environ.get(name)
-    if val:
-        return val
-    try:
-        val = st.secrets.get(name)
-    except Exception:
-        val = None
-    if val:
-        os.environ[name] = val
-    return val
-
-
 def fetch_investor_flows(code):
-    """외국인/기관/개인 순매수 금액(원). KRX_ID/KRX_PW(Secrets 또는 환경변수) 필요.
-    당일 데이터가 아직 반영 안 됐으면 최근 영업일까지 최대 6일 거슬러 조회한다."""
-    krx_id = get_secret("KRX_ID")
-    krx_pw = get_secret("KRX_PW")
-    if not (krx_id and krx_pw):
-        raise ValueError("KRX_ID/KRX_PW 미설정 (data.krx.co.kr 계정 필요)")
+    """네이버 증권 페이지의 외국인/기관 순매매수량(주, 가장 최근 거래일). 로그인 불필요."""
+    url = f"https://finance.naver.com/item/frgn.naver?code={code}"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    res = requests.get(url, headers=headers, timeout=5)
+    res.raise_for_status()
+    soup = BeautifulSoup(res.text, "html.parser")
 
-    from pykrx import stock
+    tables = soup.find_all("table", class_="type2")
+    if len(tables) < 2:
+        raise ValueError("네이버 수급 테이블을 찾을 수 없음(페이지 구조 변경 가능성)")
 
-    today = now_kst().date()
-    for i in range(6):
-        target = today - dt.timedelta(days=i)
-        d_str = target.strftime("%Y%m%d")
-        try:
-            df = stock.get_market_trading_value_by_investor(d_str, d_str, code)
-            if df is None or df.empty:
-                continue
-            result = {}
-            for label, candidates in [
-                ("외국인", ["외국인합계", "외국인"]),
-                ("기관", ["기관합계", "기관"]),
-                ("개인", ["개인"]),
-            ]:
-                for cand in candidates:
-                    if cand in df.index:
-                        result[label] = float(df.loc[cand, "순매수"])
-                        break
-            if result:
-                return result, target.strftime("%Y-%m-%d")
-        except Exception:
-            continue
-    raise ValueError("수급 데이터 조회 실패(최근 6영업일 이내 데이터 없음)")
+    date_pattern = re.compile(r"^\d{4}\.\d{2}\.\d{2}$")
+    for tr in tables[1].find_all("tr"):
+        cells = [c.get_text(strip=True) for c in tr.find_all("td")]
+        if len(cells) >= 7 and date_pattern.match(cells[0]):
+            inst = int(cells[5].replace(",", "").replace("+", "") or 0)
+            foreign = int(cells[6].replace(",", "").replace("+", "") or 0)
+            basis_date = cells[0].replace(".", "-")
+            return {"기관": inst, "외국인": foreign}, basis_date
+
+    raise ValueError("네이버 수급 데이터 파싱 실패(최근 거래일 행을 찾지 못함)")
 
 
 # ========================= 데이터 수집: 해외 =========================
@@ -414,7 +388,7 @@ def collect_all(avg_price, shares_owned):
                 "출처": "실패", "알림": f"수집실패: {e}",
             })
 
-    # 투자자별 매매동향 (외국인/기관/개인 순매수, 원)
+    # 투자자별 매매동향 (외국인/기관 순매매수량, 주 — 네이버 증권, 로그인 불필요)
     investor_flows = {}
     for name, code in DOMESTIC.items():
         try:
@@ -849,19 +823,10 @@ def show_section(title, category):
 st.divider()
 show_section("국내 (정규장 + 시간외)", "국내")
 
-# ---- 투자자별 매매동향 (외국인/기관/개인 순매수) ----
-st.subheader("투자자별 매매동향 (외국인/기관/개인 순매수)")
+# ---- 투자자별 매매동향 (외국인/기관 순매매수량) ----
+st.subheader("투자자별 매매동향 (외국인/기관 순매매수량)")
 st.caption(f"수급 데이터 마지막 갱신 시각: {data['collected_at']}")
-
-with st.expander("KRX 로그인 설정 안내 (수급 데이터가 '수집실패'로 나올 때)"):
-    st.markdown(
-        "1. https://data.krx.co.kr 에서 무료 회원가입 후 아이디/비밀번호 발급\n"
-        "2. Streamlit Cloud → 이 앱 → Settings → Secrets 에서 아래 두 줄 입력 후 저장:\n"
-        "```\nKRX_ID = \"발급받은 아이디\"\nKRX_PW = \"발급받은 비밀번호\"\n```\n"
-        "3. 저장하면 앱이 자동 재시작되며 반영됩니다.\n"
-        "4. 로컬에서 실행할 때는 환경변수로 설정: "
-        "`$env:KRX_ID=\"...\"; $env:KRX_PW=\"...\"` (PowerShell) 후 `streamlit run` 실행."
-    )
+st.caption("출처: 네이버 증권(finance.naver.com), 로그인 불필요. 단위: 주(순매매수량)")
 
 flow_rows = []
 today_str = now_kst().strftime("%Y-%m-%d")
@@ -869,7 +834,7 @@ for name in DOMESTIC:
     info = data["investor_flows"].get(name, {})
     if info.get("error"):
         flow_rows.append({
-            "종목": name, "외국인(원)": None, "기관(원)": None, "개인(원)": None,
+            "종목": name, "외국인(주)": None, "기관(주)": None,
             "기준일": None, "비고": f"수집실패: {info['error']}",
         })
     else:
@@ -878,9 +843,8 @@ for name in DOMESTIC:
         note = "" if basis_date == today_str else "당일 미반영, 최근 거래일 기준"
         flow_rows.append({
             "종목": name,
-            "외국인(원)": vals.get("외국인"),
-            "기관(원)": vals.get("기관"),
-            "개인(원)": vals.get("개인"),
+            "외국인(주)": vals.get("외국인"),
+            "기관(주)": vals.get("기관"),
             "기준일": basis_date,
             "비고": note,
         })
@@ -898,7 +862,7 @@ def color_pos_neg(val):
     return ""
 
 
-amount_cols = ["외국인(원)", "기관(원)", "개인(원)"]
+amount_cols = ["외국인(주)", "기관(주)"]
 styled_flow = flow_df.style.format({c: "{:,.0f}" for c in amount_cols}, na_rep="-")
 styled_flow = styled_flow.map(color_pos_neg, subset=amount_cols)
 st.dataframe(styled_flow, width="stretch", hide_index=True)
@@ -907,7 +871,7 @@ for name in DOMESTIC:
     vals = data["investor_flows"].get(name, {}).get("values", {})
     if vals:
         max_key = max(vals, key=lambda k: abs(vals[k]))
-        st.caption(f"{name}: 절댓값 기준 최대 매매주체 = {max_key} ({vals[max_key]:+,.0f}원)")
+        st.caption(f"{name}: 절댓값 기준 최대 매매주체 = {max_key} ({vals[max_key]:+,.0f}주)")
 
 st.subheader("관련주 (정규장 + 시간외 괴리)")
 if data["avg_gap"] is not None:
