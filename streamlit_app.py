@@ -500,6 +500,7 @@ def collect_all(avg_price, shares_owned):
 
     # 관련주 (정규장 + 시간외 + 괴리, 라이브 시간외가 없으면 최근 5일 이내 최근값을 '최근 기준'으로 표시)
     related_gaps = {}
+    related_gaps_any_cached = False
     for name, ticker in US_RELATED.items():
         try:
             price, pct, amt, ext_price, ext_pct, ext_label, ext_traded_at, ext_is_cached = fetch_yf_extended(ticker)
@@ -508,11 +509,12 @@ def collect_all(avg_price, shares_owned):
             gap = None
             if ext_pct is not None:
                 gap = round(ext_pct - pct, 2)
-                # 며칠 지난 과거 시간외가와 오늘 정규장가를 비교한 괴리는 표에는 참고로
-                # 보여주되, "시간외 강세/약세" 알림처럼 당일 신호로 쓰이는 평균 계산에는
-                # 라이브(오늘 진행 중) 값만 포함해 알림이 과거 데이터로 오도되지 않게 한다.
-                if not ext_is_cached:
-                    related_gaps[name] = gap
+                # 8개 종목 전체 평균(avg_gap)에는 캐시(최근 기준) 값도 포함한다 — 주말/장
+                # 마감 직후처럼 8종목 모두 비실시간일 때 평균이 통째로 비지 않도록 한다.
+                # 대신 캐시 값이 하나라도 섞이면 아래 알림 문구에 그 사실을 명시한다.
+                related_gaps[name] = gap
+                if ext_is_cached:
+                    related_gaps_any_cached = True
             items.append({
                 "구분": "관련주", "항목": name, "현재가": round(price, 2),
                 "등락률(%)": round(pct, 2), "등락폭": round(amt, 2),
@@ -605,8 +607,9 @@ def collect_all(avg_price, shares_owned):
         if abs(avg_gap) >= GAP_ALERT_THRESHOLD:
             direction = "강세" if avg_gap > 0 else "약세"
             detail = ", ".join(f"{k} {v:+.2f}%p" for k, v in related_gaps.items())
+            caveat = " (일부 종목은 실시간이 아닌 최근 관측값 포함)" if related_gaps_any_cached else ""
             alerts.append(
-                f"관련주 시간외 {direction}, 내일 개장 참고 신호: "
+                f"관련주 시간외 {direction}, 내일 개장 참고 신호{caveat}: "
                 f"평균 괴리 {avg_gap:+.2f}%p ({detail})"
             )
             for k in related_gaps:
@@ -1072,7 +1075,7 @@ with st.expander("확보하지 못한 항목 (개인 / 기관 세부 / 기타법
 
 st.subheader("관련주 (정규장 + 시간외 괴리)")
 if data["avg_gap"] is not None:
-    st.metric("관련주 시간외 괴리 평균 (실시간 시간외만 집계)", f"{data['avg_gap']:+.2f}%p")
+    st.metric("관련주 시간외 괴리 평균 (8종목)", f"{data['avg_gap']:+.2f}%p")
 else:
     st.write("시간외 괴리 평균 (실시간): 데이터 없음")
 
@@ -1097,9 +1100,10 @@ else:
 
 st.caption(
     "\"시간외가 구분\"이 '최근 기준(과거)'인 종목은 지금 진행 중인 시간외 세션이 없어 "
-    "최근 5일 이내 마지막 프리/애프터마켓 값을 보여준 것으로, 괴리(%p) 평균 알림에는 "
-    "포함되지 않습니다. 국내 시간외등락률·정규장등락률은 전일종가 기준, 해외 "
-    "시간외등락률은 정규장 마감가 기준(Yahoo Finance)이라 산출 기준이 다를 수 있습니다."
+    "최근 5일 이내 마지막 프리/애프터마켓 값을 보여준 것입니다. 괴리(%p) 평균에는 이런 "
+    "값도 포함되며, 하나라도 섞여 있으면 알림 문구에 \"실시간이 아닌 최근 관측값 포함\"이라고 "
+    "표시됩니다. 국내 시간외등락률·정규장등락률은 전일종가 기준, 해외 시간외등락률은 "
+    "정규장 마감가 기준(Yahoo Finance)이라 산출 기준이 다를 수 있습니다."
 )
 
 show_section("지수", "지수")
